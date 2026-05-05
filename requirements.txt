@@ -6,3 +6,5 @@ numpy
 python-multipart
 Pillow
 pydantic
+gunicorn
+uvicorn[standard]
