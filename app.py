@@ -109,5 +109,7 @@ async def get_descriptor(request: dict):
 
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting Face AI Service Debug Mode...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    port = int(os.getenv("PORT", 8000))
+    print(f"🚀 Starting Face AI Service on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
