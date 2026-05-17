@@ -22,7 +22,8 @@ async def root():
     return {
         "message": "God of Graphics - AI & Video Service is Running",
         "status": "online",
-        "version": "2.0.0"
+        "version": "2.0.0",
+        "active_backend_url": os.getenv("NODE_BACKEND_URL", "NOT_SET_IN_ENV")
     }
 
 # --- Video Processing Models & Endpoints ---
