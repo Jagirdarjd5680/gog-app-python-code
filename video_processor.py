@@ -109,7 +109,7 @@ def process_video_hls(input_path, output_dir, video_id, media_id, watermark_path
         print(f"[Processing Exception]: {str(e)}")
         try:
             backend_url = os.getenv("NODE_BACKEND_URL")
-            requests.post(urljoin(backend_url, "/api/upload/video-processed"), json={"media_id": str(media_id), "status": "failed"}, timeout=5)
+            requests.post(urljoin(backend_url, "/api/upload/video-processed"), json={"media_id": str(media_id), "status": "failed", "error": str(e)}, timeout=5)
         except:
             pass
         return False
