@@ -2,18 +2,80 @@ import face_recognition
 import cv2
 import numpy as np
 import base64
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import List, Optional
 import io
 from PIL import Image
 import time
+import os
+from dotenv import load_dotenv
+from video_processor import process_video_hls
 
-app = FastAPI(title="Face Recognition Service")
+# Load Environment Variables
+load_dotenv()
+
+app = FastAPI(title="God of Graphics - AI Service")
 
 @app.get("/")
 async def root():
-    return {"message": "God of Graphics - Face AI Service is Running", "status": "online"}
+    return {
+        "message": "God of Graphics - AI & Video Service is Running",
+        "status": "online",
+        "version": "2.0.0"
+    }
+
+# --- Video Processing Models & Endpoints ---
+
+class VideoProcessRequest(BaseModel):
+    input_path: str
+    output_dir: str
+    video_id: str
+    media_id: str
+    watermark_path: Optional[str] = None
+
+@app.post("/process-video")
+async def process_video(request: VideoProcessRequest, background_tasks: BackgroundTasks):
+    """
+    Offload heavy video processing (HLS + Encryption + Watermark) to background.
+    """
+    print(f"\n[DEBUG] Incoming /process-video for {request.video_id}")
+    
+    # 1. Check if input file exists
+    if not os.path.exists(request.input_path):
+        raise HTTPException(status_code=404, detail="Input video file not found")
+
+    # 2. Add to background tasks
+    background_tasks.add_task(
+        process_video_hls,
+        request.input_path,
+        request.output_dir,
+        request.video_id,
+        request.media_id,
+        request.watermark_path
+    )
+    
+    return {
+        "success": True, 
+        "message": "Video processing offloaded successfully",
+        "video_id": request.video_id
+    }
+
+@app.get("/video-status/{video_id}")
+async def video_status(video_id: str, output_dir: str):
+    """
+    Check if video processing is complete.
+    """
+    playlist_path = os.path.join(output_dir, "index.m3u8")
+    if os.path.exists(playlist_path):
+        return {"status": "ready", "videoId": video_id}
+    
+    if os.path.exists(output_dir):
+        return {"status": "processing", "videoId": video_id}
+        
+    return {"status": "not_found", "videoId": video_id}
+
+# --- Face Recognition (Existing Logic) ---
 
 class KnownFace(BaseModel):
     id: str
@@ -30,65 +92,42 @@ class RecognitionResult(BaseModel):
 
 @app.post("/recognize", response_model=List[RecognitionResult])
 async def recognize_faces(request: RecognitionRequest):
+    # ... (existing recognize_faces logic)
     start_time = time.time()
-    print(f"\n[DEBUG] Incoming /recognize request. Known faces: {len(request.known_faces)}")
-    
     try:
-        # 1. Decode image
         header, encoded = request.image_base64.split(",", 1) if "," in request.image_base64 else (None, request.image_base64)
         image_data = base64.b64decode(encoded)
         image = Image.open(io.BytesIO(image_data))
         rgb_image = np.array(image.convert("RGB"))
-        print(f"[DEBUG] Image decoded. Size: {image.size}")
-
-        # 2. Detect all faces and their encodings
-        face_locations = face_recognition.face_locations(rgb_image, model="hog")
-        print(f"[DEBUG] Detected {len(face_locations)} face(s) in image.")
         
+        face_locations = face_recognition.face_locations(rgb_image, model="hog")
         face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
 
         if not face_encodings:
-            print("[DEBUG] ❓ No face encodings found.")
             return []
 
-        # 3. Prepare known faces
         known_ids = [kf.id for kf in request.known_faces]
         known_encodings = [np.array(kf.descriptor) for kf in request.known_faces]
 
         results = []
-        
-        # 4. Match each detected face against all known faces
         for i, face_encoding in enumerate(face_encodings):
-            if not known_encodings:
-                continue
+            if not known_encodings: continue
                 
             face_distances = face_recognition.face_distance(known_encodings, face_encoding)
             best_match_index = np.argmin(face_distances)
             distance = face_distances[best_match_index]
             
-            print(f"[DEBUG] Face {i+1}: Best match distance = {distance:.4f} (Threshold: {request.threshold})")
-            
             if distance <= request.threshold:
-                matched_id = known_ids[best_match_index]
                 results.append(RecognitionResult(
-                    student_id=matched_id,
+                    student_id=known_ids[best_match_index],
                     confidence=float(1.0 - distance)
                 ))
-                print(f"[DEBUG] Match Found! ID: {matched_id}")
-            else:
-                print(f"[DEBUG] No match within threshold.")
-
-        end_time = time.time()
-        print(f"[DEBUG] Processing complete in {end_time - start_time:.2f} seconds.")
         return results
-
     except Exception as e:
-        print(f"[DEBUG] ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/get-descriptor")
 async def get_descriptor(request: dict):
-    print(f"\n[DEBUG] Incoming /get-descriptor request.")
     try:
         image_base64 = request.get("image_base64")
         header, encoded = image_base64.split(",", 1) if "," in image_base64 else (None, image_base64)
@@ -98,18 +137,14 @@ async def get_descriptor(request: dict):
         
         encodings = face_recognition.face_encodings(rgb_image)
         if not encodings:
-            print("[DEBUG] No face detected for descriptor.")
             return {"success": False, "message": "No face detected"}
             
-        print("[DEBUG] Descriptor generated successfully.")
         return {"success": True, "descriptor": encodings[0].tolist()}
     except Exception as e:
-        print(f"[DEBUG] ERROR: {str(e)}")
         return {"success": False, "message": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
-    import os
     port = int(os.getenv("PORT", 8000))
-    print(f"Starting Face AI Service on port {port}...")
+    print(f"Starting God of Graphics AI Service on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)

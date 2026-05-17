@@ -8,3 +8,5 @@ Pillow
 pydantic
 gunicorn
 uvicorn[standard]
+python-dotenv
+requests
