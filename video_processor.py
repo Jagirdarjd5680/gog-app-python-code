@@ -32,9 +32,21 @@ def process_video_hls(input_path, output_dir, video_id, media_id, watermark_path
 
     playlist_path = os.path.join(output_dir, "index.m3u8")
     
-    # 2. FFmpeg HLS Conversion Command
-    # We include watermark if provided
+    # 2. Fast Thumbnail Generation
     ffmpeg_bin = os.getenv("FFMPEG_PATH", "ffmpeg")
+    print(f"🖼️ [GOG AI] Generating thumbnail for {video_id}...")
+    thumb_path = os.path.join(output_dir, "thumbnail.jpg")
+    thumb_cmd = [
+        ffmpeg_bin, "-ss", "00:00:01", "-i", input_path,
+        "-vframes", "1", "-q:v", "2", thumb_path, "-y"
+    ]
+    try:
+        subprocess.run(thumb_cmd, capture_output=True, timeout=10)
+    except Exception as e:
+        print(f"⚠️ [Thumbnail Error] Could not generate thumbnail: {e}")
+
+    # 3. FFmpeg HLS Conversion Command
+    # We include watermark if provided
     ffmpeg_cmd = [
         ffmpeg_bin, "-i", input_path
     ]
@@ -72,14 +84,7 @@ def process_video_hls(input_path, output_dir, video_id, media_id, watermark_path
                 pass
             return False
             
-        # 3. Generate Thumbnail
-        thumb_path = os.path.join(output_dir, "thumbnail.jpg")
-        thumb_cmd = [
-            ffmpeg_bin, "-i", input_path,
-            "-ss", "00:00:01", "-vframes", "1",
-            "-q:v", "2", thumb_path
-        ]
-        subprocess.run(thumb_cmd, capture_output=True)
+        # (Thumbnail generation moved to before HLS conversion)
         
         # 4. Notify Node.js Backend
         backend_url = os.getenv("NODE_BACKEND_URL")
