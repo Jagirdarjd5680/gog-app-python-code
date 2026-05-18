@@ -226,33 +226,33 @@ def build_ffmpeg_cmd(
         cmd += [
             # Video stream
             "-map", f"[v{i}]",
-            f"-c:v:{i}", "libx264",
-            f"-preset:v:{i}", "medium",     # Better compression than ultrafast
-            f"-profile:v:{i}", "high",       # Not baseline — enables B-frames
-            f"-level:v:{i}", "4.1",
-            f"-crf:v:{i}", "23",             # Quality target (18–28 range)
-            f"-maxrate:v:{i}", f"{vbr}k",
-            f"-bufsize:v:{i}", f"{vbr * 2}k",
-            f"-x264opts:v:{i}", f"keyint={HLS_SEGMENT_DURATION * 30}:min-keyint={HLS_SEGMENT_DURATION * 30}:no-scenecut",
-            f"-tune:v:{i}", "film",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-profile:v", "high",
+            "-level", "4.1",
+            "-crf", "23",
+            "-maxrate:v", f"{vbr}k",
+            "-bufsize:v", f"{vbr * 2}k",
+            "-x264opts", f"keyint={HLS_SEGMENT_DURATION * 30}:min-keyint={HLS_SEGMENT_DURATION * 30}:no-scenecut",
+            "-tune", "film",
 
             # Audio stream
             "-map", "0:a:0?",
-            f"-c:a:{i}", "aac",
-            f"-b:a:{i}", f"{abr}k",
-            f"-ar:a:{i}", "48000",
-            f"-ac:a:{i}", "2",
+            "-c:a", "aac",
+            "-b:a", f"{abr}k",
+            "-ar", "48000",
+            "-ac", "2",
 
             # HLS muxer
-            f"-hls_time:v:{i}", str(HLS_SEGMENT_DURATION),
-            f"-hls_playlist_type:v:{i}", "vod",
-            f"-hls_segment_type:v:{i}", "mpegts",
-            f"-hls_segment_filename:v:{i}", segment,
-            f"-hls_key_info_file:v:{i}", key_info_path,
-            f"-hls_flags:v:{i}", "independent_segments",
-            f"-hls_list_size:v:{i}", "0",
-            f"-start_number:v:{i}", "0",
-            f"-f:v:{i}", "hls",
+            "-f", "hls",
+            "-hls_time", str(HLS_SEGMENT_DURATION),
+            "-hls_playlist_type", "vod",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", segment,
+            "-hls_key_info_file", key_info_path,
+            "-hls_flags", "independent_segments",
+            "-hls_list_size", "0",
+            "-start_number", "0",
             playlist,
         ]
 
