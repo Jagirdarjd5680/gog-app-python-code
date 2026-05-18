@@ -10,3 +10,4 @@ gunicorn
 uvicorn[standard]
 python-dotenv
 requests
+redis
