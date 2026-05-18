@@ -71,6 +71,20 @@ def get_video_duration(input_path: str) -> float:
         print(f"[ffprobe] Could not get duration: {e}")
         return 0.0
 
+def check_has_audio(input_path: str) -> bool:
+    """Return True if the video file contains at least one audio stream."""
+    try:
+        result = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", input_path],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace"
+        )
+        return "audio" in result.stdout.lower()
+    except Exception as e:
+        print(f"[ffprobe] Could not check audio stream: {e}")
+        return True # Default to True to be safe
+
 # ── Thumbnail generation ──────────────────────────────────────────────────────
 def generate_thumbnail(input_path: str, output_path: str, duration: float) -> bool:
     """Extract the sharpest frame at ~5% into the video."""
@@ -193,6 +207,7 @@ def build_ffmpeg_cmd(
     output_dir: str,
     key_info_path: str,
     video_id: str,
+    has_audio: bool = True
 ) -> list[str]:
     """
     Build a single FFmpeg command that produces all quality variants simultaneously.
@@ -235,14 +250,19 @@ def build_ffmpeg_cmd(
             "-bufsize:v", f"{vbr * 2}k",
             "-x264opts", f"keyint={HLS_SEGMENT_DURATION * 30}:min-keyint={HLS_SEGMENT_DURATION * 30}:no-scenecut",
             "-tune", "film",
+        ]
 
-            # Audio stream
-            "-map", "0:a:0?",
-            "-c:a", "aac",
-            "-b:a", f"{abr}k",
-            "-ar", "48000",
-            "-ac", "2",
+        if has_audio:
+            cmd += [
+                # Audio stream
+                "-map", "0:a:0?",
+                "-c:a", "aac",
+                "-b:a", f"{abr}k",
+                "-ar", "48000",
+                "-ac", "2",
+            ]
 
+        cmd += [
             # HLS muxer
             "-f", "hls",
             "-hls_time", str(HLS_SEGMENT_DURATION),
@@ -338,11 +358,15 @@ def process_video_hls(
         print(f"      Thumbnail: {'OK' if thumb_ok else 'FAILED'}")
 
         # ── 4. Multi-resolution FFmpeg ────────────────────────────
-        print("[4/6] Running FFmpeg multi-resolution encoding...")
+        print("[4/7] Checking for audio stream...")
+        has_audio = check_has_audio(input_path)
+        print(f"      Audio Stream: {'YES' if has_audio else 'NO (Silent Video)'}")
+
+        print("[5/7] Running FFmpeg multi-resolution encoding...")
         print(f"      Qualities: {[q[0] for q in QUALITY_LADDER]}")
         print(f"      Segment duration: {HLS_SEGMENT_DURATION}s")
 
-        ffmpeg_cmd = build_ffmpeg_cmd(input_path, output_dir, key_info_path, video_id)
+        ffmpeg_cmd = build_ffmpeg_cmd(input_path, output_dir, key_info_path, video_id, has_audio)
 
         ffmpeg_start = time.time()
         process = subprocess.run(
