@@ -149,7 +149,14 @@ async def recognize_faces(request: RecognitionRequest):
     try:
         from PIL import Image
         _, encoded = request.image_base64.split(",", 1) if "," in request.image_base64 else (None, request.image_base64)
-        image = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+        
+        # Robust Base64 Cleaning: strip newlines, spaces, fix URL-encoding '+' sign, and add missing padding
+        clean_encoded = encoded.replace(" ", "+").replace("\n", "").replace("\r", "")
+        missing_padding = len(clean_encoded) % 4
+        if missing_padding:
+            clean_encoded += "=" * (4 - missing_padding)
+
+        image = Image.open(io.BytesIO(base64.b64decode(clean_encoded))).convert("RGB")
         rgb   = np.array(image)
 
         locations = fr.face_locations(rgb, model="hog")
@@ -185,7 +192,14 @@ async def get_descriptor(request: dict):
         from PIL import Image
         img_b64 = request.get("image_base64", "")
         _, encoded = img_b64.split(",", 1) if "," in img_b64 else (None, img_b64)
-        image = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+        
+        # Robust Base64 Cleaning: strip newlines, spaces, fix URL-encoding '+' sign, and add missing padding
+        clean_encoded = encoded.replace(" ", "+").replace("\n", "").replace("\r", "")
+        missing_padding = len(clean_encoded) % 4
+        if missing_padding:
+            clean_encoded += "=" * (4 - missing_padding)
+
+        image = Image.open(io.BytesIO(base64.b64decode(clean_encoded))).convert("RGB")
         encs  = fr.face_encodings(np.array(image))
         if not encs:
             return {"success": False, "message": "No face detected"}
@@ -196,6 +210,7 @@ async def get_descriptor(request: dict):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    workers = int(os.getenv("UVICORN_WORKERS", 2))
-    print(f"Starting GOG AI Service on port {port} with {workers} workers...")
+    # On Windows, multiple workers via multiprocessing/spawn can raise WinError 10022. Force 1 worker.
+    workers = 1 if os.name == 'nt' else int(os.getenv("UVICORN_WORKERS", 2))
+    print(f"Starting GOG AI Service on port {port} with {workers} worker(s)...")
     uvicorn.run("app:app", host="0.0.0.0", port=port, workers=workers)
