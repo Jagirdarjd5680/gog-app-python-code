@@ -18,6 +18,7 @@ import hashlib
 import time
 import json
 import math
+import shutil
 import requests
 import redis
 from dotenv import load_dotenv
@@ -36,19 +37,58 @@ WEBHOOK_URL  = urljoin(BACKEND_URL, "/api/upload/video-processed")
 REDIS_HOST   = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT   = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASS   = os.getenv("REDIS_PASSWORD", None)
+INTERNAL_WEBHOOK_SECRET = os.getenv("INTERNAL_WEBHOOK_SECRET", "")
+
+def internal_headers() -> dict:
+    return {"x-internal-secret": INTERNAL_WEBHOOK_SECRET} if INTERNAL_WEBHOOK_SECRET else {}
 
 # Quality ladder templates: (label, width, height, video_bitrate_kbps, audio_bitrate_kbps)
 QUALITY_LADDER_TEMPLATES = [
-    ("240p",  426,  240,   300,  64),
-    ("480p",  854,  480,   800, 128),
-    ("720p",  1280, 720,  2000, 128),
-    ("1080p", 1920, 1080, 4500, 192),
+    ("240p",  426,  240,   250,  48),
+    ("360p",  640,  360,   450,  64),
+    ("480p",  854,  480,   700,  96),
+    ("720p",  1280, 720,  1400, 128),
+    ("1080p", 1920, 1080, 2500, 128),
 ]
 
-HLS_SEGMENT_DURATION = 4   # seconds — short for fast startup
+HLS_SEGMENT_DURATION = 6   # seconds — optimized for mobile networks
 SPRITE_INTERVAL      = 10  # seconds between sprite frames
 SPRITE_THUMB_W       = 160
 SPRITE_THUMB_H       = 90
+
+def even(value: float) -> int:
+    """Return a positive even dimension for encoder compatibility."""
+    return max(2, int(round(value / 2)) * 2)
+
+def build_quality_ladder(width: int, height: int) -> list[tuple[str, int, int, int, int]]:
+    """
+    Build output dimensions that preserve the source orientation.
+    Portrait reels should become 240x426, 480x854, 720x1280, etc.,
+    instead of being padded into landscape canvases.
+    """
+    if width <= 0 or height <= 0:
+        return QUALITY_LADDER_TEMPLATES[:1]
+
+    is_portrait = height > width
+    quality_ladder = []
+
+    for label, template_w, template_h, vbr, abr in QUALITY_LADDER_TEMPLATES:
+        if is_portrait:
+            target_w = template_h
+            if target_w > width + 10 and quality_ladder:
+                continue
+            out_w = min(target_w, width)
+            out_h = even(out_w * height / width)
+        else:
+            target_h = template_h
+            if target_h > height + 10 and quality_ladder:
+                continue
+            out_h = min(target_h, height)
+            out_w = even(out_h * width / height)
+
+        quality_ladder.append((label, even(out_w), even(out_h), vbr, abr))
+
+    return quality_ladder or [QUALITY_LADDER_TEMPLATES[0]]
 
 # ── Redis Client ─────────────────────────────────────────────────────────────
 def get_redis():
@@ -206,8 +246,8 @@ def setup_encryption(output_dir: str, video_id: str) -> tuple[str, str]:
     except Exception as e:
         print(f"[Encryption] Redis unavailable, key on disk only: {e}")
 
-    # Key URI is the Node.js endpoint that validates token and serves key
-    key_uri = f"{BACKEND_URL}/api/media/key/{video_id}?kid={key_id}"
+    # Use relative key URI to force players to propagate the playback token query param
+    key_uri = f"enc.key?kid={key_id}"
     with open(key_info_path, "w") as f:
         f.write(f"{key_uri}\n{key_path}\n")
 
@@ -236,10 +276,8 @@ def build_ffmpeg_cmd(
     # Output map and encode settings per quality
     filter_chains = []
     for i, (label, w, h, vbr, abr) in enumerate(quality_ladder):
-        # Scale preserving aspect ratio, pad to exact size
         filter_chains.append(
-            f"[v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+            f"[v:0]scale={w}:{h},setsar=1,"
             f"format=yuv420p[v{i}]"
         )
 
@@ -249,16 +287,16 @@ def build_ffmpeg_cmd(
         rend_dir = os.path.join(output_dir, label)
         os.makedirs(rend_dir, exist_ok=True)
         playlist = os.path.join(rend_dir, "playlist.m3u8")
-        segment  = os.path.join(rend_dir, "seg_%04d.ts")
+        segment  = os.path.join(rend_dir, "seg_%04d.m4s")
 
         cmd += [
             # Video stream
             "-map", f"[v{i}]",
             "-c:v", "libx264",
-            "-preset", "veryfast",   # <-- massive speedup (3x-5x faster)
+            "-preset", "faster",   # Faster compression
             "-profile:v", "high",
             "-level", "4.1",
-            "-crf", "23",
+            "-crf", "22",          # Optimized CRF
             "-maxrate:v", f"{vbr}k",
             "-bufsize:v", f"{vbr * 2}k",
             "-x264opts", f"keyint={HLS_SEGMENT_DURATION * 30}:min-keyint={HLS_SEGMENT_DURATION * 30}:no-scenecut",
@@ -276,11 +314,11 @@ def build_ffmpeg_cmd(
             ]
 
         cmd += [
-            # HLS muxer
+            # HLS muxer — optimized for fMP4 / CMAF
             "-f", "hls",
             "-hls_time", str(HLS_SEGMENT_DURATION),
             "-hls_playlist_type", "vod",
-            "-hls_segment_type", "mpegts",
+            "-hls_segment_type", "fmp4",          # Fragmented MP4 (fMP4)
             "-hls_segment_filename", segment,
             "-hls_key_info_file", key_info_path,
             "-hls_flags", "independent_segments",
@@ -291,6 +329,77 @@ def build_ffmpeg_cmd(
 
     cmd += ["-threads", "0", "-y"]
     return cmd
+
+def build_ffmpeg_cmd_for_quality(
+    input_path: str,
+    output_dir: str,
+    key_info_path: str,
+    quality: tuple,
+    has_audio: bool = True
+) -> list[str]:
+    """Build a reliable single-quality HLS command that writes real .ts chunks."""
+    label, w, h, vbr, abr = quality
+    rend_dir = os.path.join(output_dir, label)
+    os.makedirs(rend_dir, exist_ok=True)
+
+    playlist = os.path.join(rend_dir, "playlist.m3u8")
+    segment = os.path.join(rend_dir, "seg_%04d.ts")
+    vf = f"scale={w}:{h},setsar=1,format=yuv420p"
+
+    cmd = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-y",
+        "-progress", "pipe:1",
+        "-nostats",
+        "-loglevel", "warning",
+        "-i", input_path,
+        "-map", "0:v:0",
+    ]
+
+    if has_audio:
+        cmd += ["-map", "0:a:0?"]
+
+    cmd += [
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-profile:v", "main",
+        "-crf", "23",
+        "-maxrate", f"{vbr}k",
+        "-bufsize", f"{vbr * 2}k",
+        "-g", str(HLS_SEGMENT_DURATION * 30),
+        "-keyint_min", str(HLS_SEGMENT_DURATION * 30),
+        "-sc_threshold", "0",
+    ]
+
+    if has_audio:
+        cmd += [
+            "-c:a", "aac",
+            "-b:a", f"{abr}k",
+            "-ar", "48000",
+            "-ac", "2",
+        ]
+
+    cmd += [
+        "-f", "hls",
+        "-hls_time", str(HLS_SEGMENT_DURATION),
+        "-hls_playlist_type", "vod",
+        "-hls_segment_filename", segment,
+        "-hls_key_info_file", key_info_path,
+        "-hls_flags", "independent_segments",
+        "-hls_list_size", "0",
+        "-start_number", "0",
+        playlist,
+    ]
+
+    return cmd
+
+def count_hls_segments(output_dir: str, label: str) -> int:
+    rend_dir = os.path.join(output_dir, label)
+    if not os.path.exists(rend_dir):
+        return 0
+    return len([f for f in os.listdir(rend_dir) if f.endswith(".ts")])
 
 # ── Master playlist ───────────────────────────────────────────────────────────
 def write_master_playlist(output_dir: str, video_id: str, quality_ladder: list) -> str:
@@ -320,7 +429,7 @@ def write_master_playlist(output_dir: str, video_id: str, quality_ladder: list) 
 # ── Notify Node.js backend ────────────────────────────────────────────────────
 def notify_backend(payload: dict):
     try:
-        resp = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        resp = requests.post(WEBHOOK_URL, json=payload, headers=internal_headers(), timeout=10)
         print(f"[Webhook] → {WEBHOOK_URL}: {resp.status_code}")
     except Exception as e:
         print(f"[Webhook] Failed: {e}")
@@ -352,6 +461,8 @@ def process_video_hls(
     print(f"{'='*60}\n")
 
     try:
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir, ignore_errors=True)
         os.makedirs(output_dir, exist_ok=True)
 
         # ── 1. Probe duration, width, height ──────────────────────
@@ -360,13 +471,10 @@ def process_video_hls(
         print(f"      Duration: {duration:.1f}s")
         print(f"      Resolution: {width}x{height}")
 
-        # Build dynamic quality ladder: don't upscale beyond input video height!
-        quality_ladder = []
-        for label, w, h, vbr, abr in QUALITY_LADDER_TEMPLATES:
-            # Allow a tiny tolerance (e.g. if video height is 716, generate 720p)
-            if h <= height + 10 or len(quality_ladder) == 0:
-                quality_ladder.append((label, w, h, vbr, abr))
+        # Build dynamic quality ladder without changing the source orientation.
+        quality_ladder = build_quality_ladder(width, height)
         print(f"      Active HLS Quality Ladder: {[q[0] for q in quality_ladder]}")
+        print(f"      Output Dimensions: {[f'{q[0]}={q[1]}x{q[2]}' for q in quality_ladder]}")
 
         # ── 2. Encryption ─────────────────────────────────────────
         print("[2/6] Setting up AES-128 encryption...")
@@ -384,10 +492,8 @@ def process_video_hls(
         has_audio = check_has_audio(input_path)
         print(f"      Audio Stream: {'YES' if has_audio else 'NO (Silent Video)'}")
 
-        print("[5/7] Running FFmpeg multi-resolution encoding...")
+        print("[5/7] Running FFmpeg HLS encoding...")
         print(f"      Segment duration: {HLS_SEGMENT_DURATION}s")
-
-        ffmpeg_cmd = build_ffmpeg_cmd(input_path, output_dir, key_info_path, video_id, quality_ladder, has_audio)
 
         # Setup progress endpoint and state
         progress_url = urljoin(BACKEND_URL, "/api/upload/video-progress")
@@ -396,59 +502,93 @@ def process_video_hls(
                 requests.post(progress_url, json={
                     "media_id": media_id,
                     "progress": round(pct, 1)
-                }, timeout=5)
+                }, headers=internal_headers(), timeout=5)
             except Exception as pe:
                 print(f"[Progress Webhook] Failed: {pe}")
 
-        cmd_with_progress = ffmpeg_cmd + ["-progress", "-"]
+        notify_progress(5)
         ffmpeg_start = time.time()
-
-        # Execute FFmpeg in Popen mode to parse progress stdout line-by-line
-        process = subprocess.Popen(
-            cmd_with_progress,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            encoding="utf-8",
-            errors="replace"
-        )
-
-        last_reported_pct = 0.0
+        last_reported_pct = 5.0
         last_report_time = 0.0
+        total_qualities = max(len(quality_ladder), 1)
 
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
+        for quality_index, quality in enumerate(quality_ladder):
+            label = quality[0]
+            base_pct = 5 + (quality_index / total_qualities) * 90
+            range_pct = 90 / total_qualities
+            print(f"      Encoding {label} ({quality_index + 1}/{total_qualities})...")
 
-            if "out_time_us=" in line:
-                try:
-                    time_us = int(line.split("=")[1].strip())
-                    time_s = time_us / 1000000.0
-                    if duration > 0:
-                        pct = min(99.0, (time_s / duration) * 100.0)
-                        now = time.time()
-                        # Report to node backend if progress increased by 5%, or every 3 seconds
-                        if (pct - last_reported_pct >= 5.0) or (now - last_report_time >= 3.0 and pct - last_reported_pct >= 1.0):
-                            notify_progress(pct)
-                            last_reported_pct = pct
-                            last_report_time = now
-                except Exception:
-                    pass
+            ffmpeg_cmd = build_ffmpeg_cmd_for_quality(
+                input_path,
+                output_dir,
+                key_info_path,
+                quality,
+                has_audio
+            )
 
-        process.wait()
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+
+            log_tail = []
+            while True:
+                line = process.stdout.readline()
+                if line:
+                    log_tail.append(line.strip())
+                    log_tail = log_tail[-80:]
+
+                if not line and process.poll() is not None:
+                    break
+
+                if "out_time_us=" in line or "out_time_ms=" in line:
+                    try:
+                        time_raw = int(line.split("=")[1].strip())
+                        time_s = time_raw / 1000000.0
+                        if duration > 0:
+                            current_quality_pct = min(1.0, time_s / duration)
+                            pct = min(99.0, base_pct + current_quality_pct * range_pct)
+                            now = time.time()
+                            if (pct - last_reported_pct >= 2.0) or (now - last_report_time >= 3.0 and pct > last_reported_pct):
+                                notify_progress(pct)
+                                last_reported_pct = pct
+                                last_report_time = now
+                    except Exception:
+                        pass
+
+            process.wait()
+
+            if process.returncode != 0:
+                err_output = "\n".join(log_tail) or "Unknown FFmpeg error"
+                print(f"[FFmpeg ERROR: {label}]\n{err_output[-1500:]}")
+                notify_backend({
+                    "media_id": media_id,
+                    "status": "failed",
+                    "error": f"FFmpeg {label} exit {process.returncode}: {err_output[-500:]}"
+                })
+                return False
+
+            segment_count = count_hls_segments(output_dir, label)
+            if segment_count <= 0:
+                err = f"No HLS segments were written for {label}"
+                print(f"[FFmpeg ERROR: {label}] {err}")
+                notify_backend({
+                    "media_id": media_id,
+                    "status": "failed",
+                    "error": err
+                })
+                return False
+
+            notify_progress(min(99.0, base_pct + range_pct))
+            last_reported_pct = min(99.0, base_pct + range_pct)
+            print(f"      {label}: {segment_count} chunks written")
+
         ffmpeg_elapsed = time.time() - ffmpeg_start
         print(f"      FFmpeg finished in {ffmpeg_elapsed:.1f}s")
-
-        if process.returncode != 0:
-            err_output = process.stdout.read() if process.stdout else "Unknown error"
-            print(f"[FFmpeg ERROR]\n{err_output[-1000:]}")
-            notify_backend({
-                "media_id": media_id,
-                "status": "failed",
-                "error": f"FFmpeg exit {process.returncode}: {err_output[-300:]}"
-            })
-            return False
 
         # ── 5. Master playlist ────────────────────────────────────
         print("[5/6] Writing master.m3u8...")
