@@ -161,25 +161,32 @@ async def recognize_faces(request: RecognitionRequest):
 
         locations = fr.face_locations(rgb, model="hog")
         encodings = fr.face_encodings(rgb, locations)
+        print(f"[DEBUG] /recognize: faces_detected={len(encodings)} known_faces={len(request.known_faces)} threshold={request.threshold}")
         if not encodings:
+            print("[DEBUG] /recognize: no faces detected in frame")
             return []
 
         known_ids  = [kf.id for kf in request.known_faces]
         known_encs = [np.array(kf.descriptor) for kf in request.known_faces]
 
         results = []
-        for enc in encodings:
+        for i, enc in enumerate(encodings):
             if not known_encs:
                 continue
             distances = fr.face_distance(known_encs, enc)
             best = int(np.argmin(distances))
+            print(f"[DEBUG] /recognize: face#{i} closest known_id={known_ids[best]} distance={distances[best]:.4f}")
             if distances[best] <= request.threshold:
                 results.append(RecognitionResult(
                     student_id=known_ids[best],
                     confidence=float(1.0 - distances[best])
                 ))
+            else:
+                print(f"[DEBUG] /recognize: face#{i} rejected — distance {distances[best]:.4f} > threshold {request.threshold}")
+        print(f"[DEBUG] /recognize: returning {len(results)} match(es): {[(r.student_id, round(r.confidence, 3)) for r in results]}")
         return results
     except Exception as e:
+        print(f"[DEBUG] /recognize: ERROR {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/get-descriptor")
@@ -200,11 +207,17 @@ async def get_descriptor(request: dict):
             clean_encoded += "=" * (4 - missing_padding)
 
         image = Image.open(io.BytesIO(base64.b64decode(clean_encoded))).convert("RGB")
-        encs  = fr.face_encodings(np.array(image))
+        arr = np.array(image)
+        print(f"[DEBUG] /get-descriptor: image_shape={arr.shape} b64_len={len(clean_encoded)}")
+        encs  = fr.face_encodings(arr)
+        print(f"[DEBUG] /get-descriptor: faces_detected={len(encs)}")
         if not encs:
+            print("[DEBUG] /get-descriptor: no face found — returning success=False")
             return {"success": False, "message": "No face detected"}
+        print(f"[DEBUG] /get-descriptor: success — descriptor_len={len(encs[0])}")
         return {"success": True, "descriptor": encs[0].tolist()}
     except Exception as e:
+        print(f"[DEBUG] /get-descriptor: ERROR {e}")
         return {"success": False, "message": str(e)}
 
 if __name__ == "__main__":
